@@ -1,0 +1,91 @@
+name: Build AstrBot armv7 (玩客云)
+
+# 在 GitHub 的免费 x86 服务器上用 QEMU 模拟 armv7 构建，产出可直接 docker load 的镜像包。
+# 用法：Actions 页面 → 本工作流 → Run workflow。
+#
+# 设计要点：
+#   1. 不推送任何镜像仓库（fork 出来的仓库默认没有 packages 写权限，推送会直接失败）；
+#      构建完用 docker save 打成 tar.gz 作为 artifact 下载，最省事也最不容易卡权限。
+#   2. 构建完会在 QEMU 里真正跑一次 import 检查，镜像里缺依赖会在这里暴露，
+#      而不是等你在玩客云上启动时才发现。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master, main]
+    paths:
+      - 'Dockerfile.armv7'
+      - 'Dockerfile.armv7.dockerignore'
+      - 'requirements.armv7.txt'
+      - 'faiss_shim/**'
+      - '.github/workflows/build-armv7.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: linux/arm/v7
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 注册 QEMU（arm/v7）
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm/v7
+
+      - name: 准备 buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          name: astrbot-armv7
+          driver: docker-container
+
+      - name: 构建镜像（linux/arm/v7）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.armv7
+          platforms: linux/arm/v7
+          tags: astrbot-armv7:latest
+          load: true
+          build-args: |
+            WITH_NODE=1
+            FAISS_SHIM=1
+            PIP_INDEX_URL=https://pypi.org/simple
+            PIWHEELS_URL=https://www.piwheels.org/simple
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 校验架构
+        run: |
+          set -eux
+          docker image inspect astrbot-armv7:latest --format '{{.Os}}/{{.Architecture}}'
+          docker run --rm --platform linux/arm/v7 --entrypoint python astrbot-armv7:latest -c \
+            "import platform; print('machine =', platform.machine())"
+
+      - name: 校验运行时依赖（在 QEMU 里真跑）
+        run: |
+          set -eux
+          docker run --rm --platform linux/arm/v7 --entrypoint python astrbot-armv7:latest -c \
+            "import faiss, numpy, quart, aiohttp, pydantic, ormsgpack, watchfiles, lxml, PIL, cryptography, sqlmodel; print('deps ok, faiss =', faiss.__file__)"
+
+      - name: 导出镜像为 tar.gz
+        run: |
+          set -eux
+          docker save astrbot-armv7:latest | gzip -9 > astrbot-armv7.tar.gz
+          ls -lh astrbot-armv7.tar.gz
+          sha256sum astrbot-armv7.tar.gz | tee astrbot-armv7.tar.gz.sha256
+
+      - name: 上传 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: astrbot-armv7-image
+          path: |
+            astrbot-armv7.tar.gz
+            astrbot-armv7.tar.gz.sha256
+          compression-level: 0
+          retention-days: 7
