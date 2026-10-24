@@ -88,28 +88,52 @@ RUN set -eux; \
     python -m pip check || true
 
 # ---------------------------------------------------------------------------
+# numpy 的线性代数运行时
+#   故意放在 pip 之后：改 apt 层会让 pip 那 200 个包全部重装（约 10 分钟），
+#   放在这里则只在它自己变化时重跑。
+#
+#   piwheels 的 numpy 轮子是**动态链接系统 OpenBLAS** 的，没把 .so 打进 wheel。
+#   缺了 import 时会炸 `ImportError: libopenblas.so.0: cannot open shared object file`，
+#   而 pip 安装阶段完全看不出来——这类故障只有真正 import 才暴露。
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends libopenblas0 libgfortran5 libgomp1 \
+      || apt-get install -y --no-install-recommends libopenblas0-pthread libgfortran5 libgomp1; \
+    rm -rf /var/lib/apt/lists/*; \
+    python -c "import ctypes.util as u; print('[armv7] openblas ->', u.find_library('openblas'))"
+
+# ---------------------------------------------------------------------------
 # faiss 兼容层
 #   astrbot/core/db/vec_db/faiss_impl/embedding_storage.py 在导入期就 import faiss，
 #   缺了会直接 ImportError。这里放一个纯 numpy 实现顶上（L2 暴力检索）。
 #
-#   注意：这里**不往 site-packages 里 cp**。不同镜像（尤其 armv7 变体）的
-#   site.getsitepackages() 可能返回空列表，取 [0] 会直接 IndexError，
-#   导致整个构建在第 14 层失败且报错信息很不直观。
-#   改成把目录挂到 PYTHONPATH 前面，import 一定会命中，也便于 --FAISS_SHIM=0 关掉。
+#   这里刻意做成 **诊断式**（set -x、每条命令都打印退出码、不因失败而中断）：
+#   armv7 + QEMU 环境下这一步的失败信息经常被几百行 pip 日志淹没，
+#   所以把每一步的结果都打到日志里，最后再统一判定。
+#   想完全跳过兼容层：--build-arg FAISS_SHIM=0
 # ---------------------------------------------------------------------------
 COPY faiss_shim/faiss.py /opt/faiss_shim/faiss.py
 
 ENV PYTHONPATH=/opt/faiss_shim
 
-RUN set -eux; \
+RUN set -x; \
     if [ "$FAISS_SHIM" != "1" ]; then \
-        rm -f /opt/faiss_shim/faiss.py; \
-        echo "[armv7] faiss shim disabled"; \
-        exit 0; \
+        rm -f /opt/faiss_shim/faiss.py; echo "[armv7] faiss shim disabled"; exit 0; \
     fi; \
-    python -c "import numpy as np; print('[armv7] numpy', np.__version__)"; \
-    python -c "import faiss; print('[armv7] faiss shim:', faiss.__file__, faiss.__version__)"; \
-    python -c "import numpy as np, faiss; idx = faiss.IndexIDMap(faiss.IndexFlatL2(4)); idx.add_with_ids(np.array([[1,2,3,4]], dtype='float32'), np.array([7])); d, i = idx.search(np.array([[1,2,3,4]], dtype='float32'), 1); print('[armv7] shim round-trip ok:', d.tolist(), i.tolist()); assert i[0][0] == 7, i"
+    echo "=== [armv7] env ==="; \
+    python -V; echo "rc_python=$?"; \
+    echo "PYTHONPATH=$PYTHONPATH"; \
+    ls -l /opt/faiss_shim; echo "rc_ls=$?"; \
+    echo "=== [armv7] syntax ==="; \
+    python -c "import py_compile; py_compile.compile('/opt/faiss_shim/faiss.py', doraise=True); print('SYNTAX OK')"; echo "rc_syntax=$?"; \
+    echo "=== [armv7] numpy ==="; \
+    python -c "import numpy; print('NUMPY', numpy.__version__, numpy.__file__)"; echo "rc_numpy=$?"; \
+    echo "=== [armv7] import faiss ==="; \
+    python -c "import faiss; print('FAISS', getattr(faiss, '__version__', '?'), faiss.__file__)"; echo "rc_import=$?"; \
+    echo "=== [armv7] smoke ==="; \
+    python -c "import numpy as np, faiss; idx = faiss.IndexIDMap(faiss.IndexFlatL2(4)); idx.add_with_ids(np.array([[1,2,3,4]], dtype='float32'), np.array([7])); d, i = idx.search(np.array([[1,2,3,4]], dtype='float32'), 1); print('SMOKE', d.tolist(), i.tolist()); assert i[0][0] == 7, i" > /tmp/smoke.log 2>&1; rc=$?; cat /tmp/smoke.log; echo "rc_smoke=$rc"; \
+    test "$rc" = "0"
 
 # ---------------------------------------------------------------------------
 # 应用代码
