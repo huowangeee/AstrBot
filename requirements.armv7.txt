@@ -1,0 +1,56 @@
+# AstrBot armv7 依赖清单
+#
+# 基于仓库根目录 requirements.txt，差异只有两处：
+#   1. 去掉 faiss-cpu —— 它没有任何 armv7 轮子（piwheels / PyPI 都没有），
+#      源码编译需要 BLAS + 大量内存，1GB 的 S805 不可能完成。
+#      运行时由 faiss_shim/faiss.py 用 numpy 顶上。
+#   2. 显式补上 numpy —— 原本它只是 faiss-cpu 的传递依赖。
+#
+# 其余保持与上游一致，方便跟随版本升级。
+
+aiohttp
+pydantic~=2.10.3
+psutil>=5.8.0
+openai
+anthropic
+qq-botpy
+chardet~=5.1.0
+Pillow
+beautifulsoup4
+mi-googlesearch-python
+readability-lxml
+quart
+lxml_html_clean
+colorlog
+aiocqhttp
+pyjwt
+apscheduler
+docstring_parser
+aiodocker
+silk-python
+lark-oapi
+ormsgpack
+cryptography
+dashscope
+python-telegram-bot
+wechatpy
+dingtalk-stream
+defusedxml
+mcp
+certifi
+pip
+telegramify-markdown
+google-genai
+click
+filelock
+watchfiles
+websockets
+numpy
+aiosqlite
+py-cord>=2.6.1
+slack-sdk
+pydub
+sqlmodel
+deprecated
+sqlalchemy[asyncio]
+audioop-lts; python_version>='3.13'
