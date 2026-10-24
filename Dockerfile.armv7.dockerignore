@@ -1,0 +1,19 @@
+# Dockerfile.armv7 专用忽略清单（BuildKit 支持 <Dockerfile>.dockerignore）
+.git
+.github
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+data/
+logs/
+build-armv7.log
+astrbot-armv7.tar
+astrbot-armv7.tar.gz
+_selftest*
+_repo_tree.txt
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+node_modules/
