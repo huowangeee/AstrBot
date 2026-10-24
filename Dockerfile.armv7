@@ -1,0 +1,119 @@
+# syntax=docker/dockerfile:1.6
+#
+# AstrBot — linux/arm/v7 构建文件
+# 目标设备：玩客云 / OneCloud（Amlogic S805，Cortex-A5 ×4，1~2 GB RAM，armhf）
+#
+# 与官方 Dockerfile 的差异（每一项都是为了能在 armv7 上装起来）：
+#   1. PyPI 上没有 armv7 轮子，依赖优先从 piwheels（树莓派 armv7 轮子仓库）取；
+#      配合 --only-binary，让 pip 自动回退到"有 armv7 轮子的那个版本"，
+#      而不是去源码编译（在 Cortex-A5 上编译 numpy/pillow 会跑到天荒地老）。
+#   2. 不安装 faiss-cpu：它从来没有发布过 armv7 轮子，源码编译需要 BLAS/LAPACK
+#      且 1 GB 内存基本必然 OOM。改为内置纯 numpy 兼容实现（见 faiss_shim/）。
+#   3. Node.js 改从 Debian 源装：NodeSource 从 Node 16 起已停止发布 armhf 包。
+#   4. 补齐编译型依赖的 -dev 头文件，作为个别包仍回退源码编译时的兜底。
+#
+FROM python:3.11-slim-bookworm
+
+# WITH_NODE=1      安装 Debian 的 nodejs/npm（个别插件需要，不用可设 0 省 ~80MB）
+# FAISS_SHIM=1     安装 numpy 版 faiss 兼容层（关掉则知识库功能不可用）
+# PIP_INDEX_URL    Python 包索引（默认清华源，可换阿里/官方）
+# PIWHEELS_URL     armv7 轮子源（piwheels 为 HTTPS，国内可能较慢，见 README）
+ARG WITH_NODE=1
+ARG FAISS_SHIM=1
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIWHEELS_URL=https://www.piwheels.org/simple
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=Asia/Shanghai \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_PREFER_BINARY=1 \
+    PIP_DEFAULT_TIMEOUT=120 \
+    PIP_RETRIES=10
+
+WORKDIR /AstrBot
+
+# ---------------------------------------------------------------------------
+# 系统依赖
+#   运行期：ffmpeg（语音/音频）、ca-certificates、tzdata
+#   编译期：build-essential + 各类 -dev；只在构建阶段用，最后不清理也无妨
+#           （清理掉 /var/lib/apt/lists 已省去大部分体积）
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+        ca-certificates curl bash tzdata procps git \
+        build-essential python3-dev pkg-config cmake \
+        libffi-dev libssl-dev \
+        libxml2-dev libxslt1-dev zlib1g-dev \
+        libjpeg62-turbo-dev libopenjp2-7-dev libtiff-dev libwebp-dev \
+        libsqlite3-dev libbz2-dev \
+        ffmpeg; \
+    rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Node.js（可选）
+#   Debian bookworm armhf 自带 nodejs 18.19，够用；NodeSource 已不发布 armhf。
+# ---------------------------------------------------------------------------
+RUN set -eux; \
+    if [ "$WITH_NODE" = "1" ]; then \
+        apt-get update; \
+        apt-get install -y --no-install-recommends nodejs npm; \
+        rm -rf /var/lib/apt/lists/*; \
+        node -v || true; \
+    else \
+        echo "[armv7] skip nodejs"; \
+    fi
+
+# ---------------------------------------------------------------------------
+# Python 依赖
+#
+# --only-binary 里的包都是"必须靠轮子"的 C/Rust 扩展：
+#   如果最新版没有 armv7 轮子，pip 会自动挑一个有 armv7 轮子的旧版本，
+#   而不是退回源码编译。不在列表里的包（纯 Python）可以有 sdist 兜底。
+# ---------------------------------------------------------------------------
+COPY requirements.armv7.txt /tmp/requirements.armv7.txt
+
+RUN set -eux; \
+    python -m pip install --upgrade "pip>=24.0" setuptools wheel; \
+    pip install \
+        --index-url "$PIP_INDEX_URL" \
+        --extra-index-url "$PIWHEELS_URL" \
+        --only-binary=aiohttp,Pillow,lxml,numpy,cryptography,pydantic-core,ormsgpack,watchfiles,psutil,multidict,yarl,frozenlist,aiosignal,pycryptodome,MarkupSafe \
+        -r /tmp/requirements.armv7.txt; \
+    python -m pip check || true
+
+# ---------------------------------------------------------------------------
+# faiss 兼容层
+#   astrbot/core/db/vec_db/faiss_impl/embedding_storage.py 在导入期就 import faiss，
+#   缺了会直接 ImportError。这里放一个纯 numpy 实现顶上（L2 暴力检索），
+#   保证知识库/向量检索不会让进程起不来。
+# ---------------------------------------------------------------------------
+COPY faiss_shim/faiss.py /opt/faiss_shim/faiss.py
+
+RUN set -eux; \
+    if [ "$FAISS_SHIM" = "1" ]; then \
+        site_dir="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
+        cp /opt/faiss_shim/faiss.py "$site_dir/faiss.py"; \
+        python -c "import faiss; print('[armv7] faiss shim:', faiss.__file__)"; \
+    else \
+        echo "[armv7] faiss shim disabled"; \
+    fi
+
+# ---------------------------------------------------------------------------
+# 应用代码
+# ---------------------------------------------------------------------------
+COPY . /AstrBot/
+
+RUN set -eux; \
+    mkdir -p /AstrBot/data /AstrBot/packages; \
+    python -c "import importlib.util as u,sys; mods=['quart','aiohttp','pydantic','ormsgpack','watchfiles','lxml','PIL','numpy','cryptography','sqlmodel']; bad=[m for m in mods if u.find_spec(m) is None]; print('[armv7] core deps OK' if not bad else '[armv7] MISSING: '+str(bad)); sys.exit(1 if bad else 0)"
+
+VOLUME ["/AstrBot/data"]
+EXPOSE 6185 6186 6195 6196 6199 11451
+
+CMD ["python", "main.py"]
