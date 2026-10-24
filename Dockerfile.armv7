@@ -90,19 +90,26 @@ RUN set -eux; \
 # ---------------------------------------------------------------------------
 # faiss 兼容层
 #   astrbot/core/db/vec_db/faiss_impl/embedding_storage.py 在导入期就 import faiss，
-#   缺了会直接 ImportError。这里放一个纯 numpy 实现顶上（L2 暴力检索），
-#   保证知识库/向量检索不会让进程起不来。
+#   缺了会直接 ImportError。这里放一个纯 numpy 实现顶上（L2 暴力检索）。
+#
+#   注意：这里**不往 site-packages 里 cp**。不同镜像（尤其 armv7 变体）的
+#   site.getsitepackages() 可能返回空列表，取 [0] 会直接 IndexError，
+#   导致整个构建在第 14 层失败且报错信息很不直观。
+#   改成把目录挂到 PYTHONPATH 前面，import 一定会命中，也便于 --FAISS_SHIM=0 关掉。
 # ---------------------------------------------------------------------------
 COPY faiss_shim/faiss.py /opt/faiss_shim/faiss.py
 
+ENV PYTHONPATH=/opt/faiss_shim
+
 RUN set -eux; \
-    if [ "$FAISS_SHIM" = "1" ]; then \
-        site_dir="$(python -c 'import site; print(site.getsitepackages()[0])')"; \
-        cp /opt/faiss_shim/faiss.py "$site_dir/faiss.py"; \
-        python -c "import faiss; print('[armv7] faiss shim:', faiss.__file__)"; \
-    else \
+    if [ "$FAISS_SHIM" != "1" ]; then \
+        rm -f /opt/faiss_shim/faiss.py; \
         echo "[armv7] faiss shim disabled"; \
-    fi
+        exit 0; \
+    fi; \
+    python -c "import numpy as np; print('[armv7] numpy', np.__version__)"; \
+    python -c "import faiss; print('[armv7] faiss shim:', faiss.__file__, faiss.__version__)"; \
+    python -c "import numpy as np, faiss; idx = faiss.IndexIDMap(faiss.IndexFlatL2(4)); idx.add_with_ids(np.array([[1,2,3,4]], dtype='float32'), np.array([7])); d, i = idx.search(np.array([[1,2,3,4]], dtype='float32'), 1); print('[armv7] shim round-trip ok:', d.tolist(), i.tolist()); assert i[0][0] == 7, i"
 
 # ---------------------------------------------------------------------------
 # 应用代码
@@ -111,7 +118,8 @@ COPY . /AstrBot/
 
 RUN set -eux; \
     mkdir -p /AstrBot/data /AstrBot/packages; \
-    python -c "import importlib.util as u,sys; mods=['quart','aiohttp','pydantic','ormsgpack','watchfiles','lxml','PIL','numpy','cryptography','sqlmodel']; bad=[m for m in mods if u.find_spec(m) is None]; print('[armv7] core deps OK' if not bad else '[armv7] MISSING: '+str(bad)); sys.exit(1 if bad else 0)"
+    python -c "import importlib.util as u,sys; mods=['quart','aiohttp','pydantic','ormsgpack','watchfiles','lxml','PIL','numpy','cryptography','sqlmodel']; bad=[m for m in mods if u.find_spec(m) is None]; print('[armv7] core deps OK' if not bad else '[armv7] MISSING: '+str(bad)); sys.exit(1 if bad else 0)"; \
+    python -c "import sys; print('[armv7] python', sys.version.split()[0], '| platform', sys.platform)"
 
 VOLUME ["/AstrBot/data"]
 EXPOSE 6185 6186 6195 6196 6199 11451
